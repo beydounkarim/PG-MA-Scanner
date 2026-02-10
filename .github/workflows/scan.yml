@@ -1,0 +1,111 @@
+name: PG M&A Scanner
+
+on:
+  # Automatic weekly run
+  schedule:
+    - cron: '0 14 * * 1'  # Every Monday at 2 PM UTC (9 AM ET)
+
+  # Manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      period:
+        description: 'Scan period'
+        required: true
+        default: 'last_week'
+        type: choice
+        options:
+          - last_week
+          - last_month
+          - last_quarter
+          - last_6_months
+          - '2025'
+          - '2024'
+          - '2024-Q4'
+          - '2025-Q1'
+      test_mode:
+        description: 'Test mode (only scan 20 companies)'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Dry run (scan but do not write to Google Sheets)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # Safety: kill if running > 2 hours
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine scan period
+        id: period
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "period=last_week" >> $GITHUB_OUTPUT
+          else
+            echo "period=${{ inputs.period }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build CLI flags
+        id: flags
+        run: |
+          FLAGS=""
+          if [ "${{ inputs.test_mode }}" = "true" ]; then
+            FLAGS="$FLAGS --test"
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            FLAGS="$FLAGS --dry-run"
+          fi
+          echo "flags=$FLAGS" >> $GITHUB_OUTPUT
+
+      - name: Run M&A scanner
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          python src/main.py \
+            --period ${{ steps.period.outputs.period }} \
+            ${{ steps.flags.outputs.flags }}
+
+      - name: Send notifications
+        if: success() && inputs.dry_run != 'true' && github.event_name != 'schedule'
+        run: |
+          python -c "
+          import os
+          from src.notifier import notify_all
+          from src.sheets_output import open_sheet, get_sheet_url, load_existing_deals
+
+          # Get sheet URL
+          sheet = open_sheet()
+          sheet_url = get_sheet_url(sheet)
+
+          # Load new deals (would need to track these from main.py output)
+          # For now, just send a basic notification
+          notify_all([], sheet_url)
+          "
+
+      - name: Report outcome
+        if: always()
+        run: |
+          echo "## Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **Period:** ${{ steps.period.outputs.period }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Test mode:** ${{ inputs.test_mode || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dry run:** ${{ inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
