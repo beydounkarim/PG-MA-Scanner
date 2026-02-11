@@ -242,6 +242,47 @@ pytest --cov=src tests/
 - Try `--test` mode first to validate setup
 - Check Claude API key is valid
 
+## Rate Limiting & Checkpoints
+
+The scanner uses checkpoint-based writes to handle Google Sheets API rate limits:
+
+- **Batch writes**: All deals written in single API calls (vs looped calls)
+- **Rate limiting**: 1-second delays between operations
+- **Checkpoints**: All results saved to JSON before writing to Sheets
+- **Retry script**: Resume from failures without re-scanning
+
+### Checkpoint Files
+
+Location: `data/checkpoints/`
+
+Checkpoints are automatically created after scanning completes. They contain:
+- All deals (new, excluded, unverified)
+- Scan metadata (period, dates, companies)
+- Write progress tracking
+- Validation statistics
+
+### Retry Failed Writes
+
+If a write fails (network timeout, rate limit, etc.):
+
+```bash
+# Retry latest checkpoint
+python src/retry_write.py
+
+# Retry specific checkpoint
+python src/retry_write.py --checkpoint data/checkpoints/checkpoint_2025-01_*.json
+
+# Force rewrite everything
+python src/retry_write.py --force
+```
+
+### Troubleshooting Rate Limits
+
+If you see 429 errors:
+1. Check `data/checkpoints/` for latest checkpoint
+2. Run retry script (it includes rate limiting)
+3. If issue persists, increase delays in `sheets_output.py` (line 376)
+
 ## Project Status
 
 **Current Implementation:** Phase 1 - Foundation & Configuration

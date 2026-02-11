@@ -62,3 +62,13 @@ logs/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Checkpoint files
+data/checkpoints/
+
+# Excel exports
+*.xlsx
+data/*.xlsx
+
+# Backup files
+data/backups/

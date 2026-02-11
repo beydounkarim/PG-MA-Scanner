@@ -12,6 +12,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from datetime import date, timedelta
 from typing import Tuple
 
@@ -242,7 +243,7 @@ def main():
         build_dedup_state, append_new_deals, append_excluded_deals,
         append_unverified_deals, update_executive_summary, get_sheet_url
     )
-    from dedup import generate_deal_id, is_new_alert, update_state_in_memory
+    from dedup import generate_deal_id, is_new_alert, update_state_in_memory, categorize_candidate
     from source_validator import (
         run_pre_validation_qa, apply_pre_validation_flags, validate_all_deals
     )
@@ -331,16 +332,41 @@ def main():
 
     print(f"✓ Matched {len(matched_candidates)} deals to PG accounts\n")
 
-    # 7. Tier 3: Deep dive verification (only on matched deals)
-    print("TIER 3: Deep Dive Verification")
+    # 6.5. SMART DEDUPLICATION - Categorize candidates BEFORE Tier 3-4
+    print("SMART DEDUPLICATION: Categorizing candidates...")
+    print("=" * 60)
+
+    exact_matches = 0
+    status_updates_count = 0
+    new_deals_to_verify = []
+
+    for candidate in matched_candidates:
+        category, existing_state = categorize_candidate(candidate, state)
+
+        if category == "exact_match":
+            # Skip - already in Google Sheets with same status
+            exact_matches += 1
+        elif category == "status_update":
+            # Status changed - verify this as a new alert
+            status_updates_count += 1
+            new_deals_to_verify.append(candidate)
+        else:  # new_deal
+            new_deals_to_verify.append(candidate)
+
+    print(f"✓ Exact matches (skip Tier 3-4): {exact_matches}")
+    print(f"✓ Status updates (run Tier 3 only): {status_updates_count}")
+    print(f"✓ New deals (run full Tier 3-4): {len(new_deals_to_verify) - status_updates_count}\n")
+
+    # 7. Tier 3: Deep dive verification (only on NEW deals and status updates)
+    print(f"TIER 3: Deep Dive Verification ({len(new_deals_to_verify)} deals)")
     print("=" * 60)
 
     verified_deals = []
     excluded_deals = []
     unverified_deals = []
 
-    for i, candidate in enumerate(matched_candidates, 1):
-        print(f"[{i}/{len(raw_candidates)}] Verifying: "
+    for i, candidate in enumerate(new_deals_to_verify, 1):
+        print(f"[{i}/{len(new_deals_to_verify)}] Verifying: "
               f"{candidate.get('acquiror')} → {candidate.get('target')}")
 
         result = run_tier3_verification(candidate)
@@ -383,6 +409,23 @@ def main():
             deal["opportunity"] = opportunity
 
         print(f"\n✓ Tier 4 complete\n")
+
+    # 8.5. CHECKPOINT: Save all results to JSON before validation
+    print("Saving checkpoint...")
+    from sheets_output import save_checkpoint
+
+    checkpoint_path = save_checkpoint(
+        new_deals=verified_deals,
+        excluded_deals=excluded_deals,
+        unverified_deals=unverified_deals,
+        scan_period=args.period,
+        start_date=start_date,
+        end_date=end_date,
+        validation_stats={},  # Will be updated after source validation
+        total_companies=len(companies),
+        test_mode=args.test
+    )
+    print(f"✓ Checkpoint saved: {checkpoint_path}\n")
 
     # 9. SOURCE VALIDATION - QA/QC GATE (mandatory, 4 stages)
     print("SOURCE VALIDATION PIPELINE")
@@ -428,9 +471,18 @@ def main():
 
     print(f"✓ Found {len(new_deals)} new alerts (after dedup)\n")
 
+    # Update checkpoint with final deduplicated new_deals
+    import json
+    with open(checkpoint_path, 'r') as f:
+        checkpoint = json.load(f)
+    checkpoint["deals"]["new_deals"] = new_deals
+    with open(checkpoint_path, 'w') as f:
+        json.dump(checkpoint, f, indent=2, ensure_ascii=False)
+
     # 11. Write to Google Sheets (unless dry run)
     if not args.dry_run:
-        print("Writing to Google Sheets...")
+        print("Writing to Google Sheets with rate limiting...")
+        from sheets_output import update_checkpoint_progress
 
         # Normalize field names for Sheets
         for deal in new_deals:
@@ -439,9 +491,39 @@ def main():
             deal.setdefault("date_announced", "")
             deal.setdefault("date_closed", "")
 
-        append_new_deals(spreadsheet, new_deals, args.period)
-        append_excluded_deals(spreadsheet, excluded_deals, args.period)
-        append_unverified_deals(spreadsheet, unverified_deals, args.period)
+        try:
+            # Write new deals
+            print(f"Writing {len(new_deals)} new deals...")
+            append_new_deals(spreadsheet, new_deals, args.period)
+            update_checkpoint_progress(checkpoint_path, "new_deals", success=True)
+            print("✓ New deals written")
+
+            # Rate limit: 1 second between major operations
+            time.sleep(1)
+
+            # Write excluded deals
+            print(f"Writing {len(excluded_deals)} excluded deals...")
+            append_excluded_deals(spreadsheet, excluded_deals, args.period)
+            update_checkpoint_progress(checkpoint_path, "excluded_deals", success=True)
+            print("✓ Excluded deals written")
+
+            # Rate limit
+            time.sleep(1)
+
+            # Write unverified deals
+            print(f"Writing {len(unverified_deals)} unverified deals...")
+            append_unverified_deals(spreadsheet, unverified_deals, args.period)
+            update_checkpoint_progress(checkpoint_path, "unverified_deals", success=True)
+            print("✓ Unverified deals written")
+
+            # Rate limit
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"\n⚠️  Error writing to Sheets: {e}")
+            print(f"Checkpoint saved at: {checkpoint_path}")
+            print("Run the retry script to resume: python src/retry_write.py")
+            sys.exit(1)
 
         # Refresh all_deals from sheet for accurate summary
         all_deals = load_existing_deals(spreadsheet)
@@ -454,13 +536,16 @@ def main():
             "unverified": len(unverified_deals),
         }
 
+        print("Updating executive summary...")
         update_executive_summary(
             spreadsheet, new_deals, all_deals,
             len(excluded_deals), len(unverified_deals),
             args.period, validation_stats
         )
+        update_checkpoint_progress(checkpoint_path, "executive_summary", success=True)
+        print("✓ Executive summary updated")
 
-        print(f"✓ Google Sheet updated: {sheet_url}\n")
+        print(f"\n✓ Google Sheet updated: {sheet_url}\n")
     else:
         print(f"✓ DRY RUN - no changes written. Sheet: {sheet_url}\n")
 

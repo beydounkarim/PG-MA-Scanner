@@ -192,6 +192,53 @@ def is_new_alert(deal: dict, state: dict) -> bool:
     return deal_status not in stages_reported
 
 
+def categorize_candidate(candidate: dict, state: dict) -> tuple[str, Optional[dict]]:
+    """
+    Categorize a candidate deal against existing state.
+
+    Returns:
+        Tuple of (category, existing_deal):
+        - ("exact_match", existing_deal): Same deal, same status - skip Tier 3-4
+        - ("status_update", existing_deal): Same deal, status changed - update status only
+        - ("new_deal", None): Completely new deal - run full Tier 3-4
+
+    Args:
+        candidate: Candidate deal dict from Tier 2
+        state: Dedup state dict from Google Sheets
+
+    Examples:
+        >>> state = {"chevron_hess": {"deal_status": "announced", ...}}
+        >>> categorize_candidate({"acquiror": "Chevron", "target": "Hess", "deal_status": "Announced"}, state)
+        ("exact_match", {...})
+        >>> categorize_candidate({"acquiror": "Chevron", "target": "Hess", "deal_status": "Closed"}, state)
+        ("status_update", {...})
+        >>> categorize_candidate({"acquiror": "Shell", "target": "NewCo", "deal_status": "Rumored"}, state)
+        ("new_deal", None)
+    """
+    # Generate deal_id for candidate
+    deal_id = generate_deal_id(
+        candidate.get("acquiror", ""),
+        candidate.get("target", "")
+    )
+
+    # Normalize candidate status
+    candidate_status = candidate.get("deal_status", "").lower()
+
+    # Check if deal exists in state
+    if deal_id not in state:
+        return ("new_deal", None)
+
+    existing = state[deal_id]
+    existing_status = existing.get("current_status", "").lower()
+
+    # Check if status is the same
+    if candidate_status == existing_status:
+        return ("exact_match", existing)
+    else:
+        # Status changed (e.g., Announced → Closed)
+        return ("status_update", existing)
+
+
 def update_state_in_memory(deal: dict, state: dict) -> dict:
     """
     Add this deal/stage to the in-memory state dict.

@@ -198,7 +198,12 @@ def run_tier2_scans(companies: list[dict], start_date: str, end_date: str) -> li
 For each company, search for mergers, acquisitions, divestitures, or spin-offs
 they have been involved in (as either buyer or seller/target) between {start_date} and {end_date}.
 
-Only include deals where an event (rumor, announcement, or closing) occurred within this date range.
+CRITICAL: Include ALL deals where ANY of these dates fall within the range:
+- Date rumored
+- Date announced
+- Date closed (MOST IMPORTANT - capture deals announced earlier but closed in this period)
+
+Example: A deal announced in Oct 2023 but closed in May 2024 MUST be included.
 
 Apply the same filters:
 - EXCLUDE PE/financial buyers
@@ -219,8 +224,8 @@ For each deal found, return:
 
 Return as JSON array. If no deals found for any company, return []."""
 
-    # Split into batches of 20
-    BATCH_SIZE = 20
+    # Split into batches of 3 (more thorough, catches major deals)
+    BATCH_SIZE = 3
     batches = [companies[i:i + BATCH_SIZE] for i in range(0, len(companies), BATCH_SIZE)]
 
     all_deals = []
@@ -236,7 +241,7 @@ Return as JSON array. If no deals found for any company, return []."""
 
         try:
             response = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="claude-opus-4-6",
                 max_tokens=4096,
                 tools=[{
                     "type": "web_search_20250305",

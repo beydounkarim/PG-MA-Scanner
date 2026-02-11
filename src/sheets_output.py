@@ -9,7 +9,8 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
 import os
-from datetime import date
+import time
+from datetime import date, datetime
 from typing import Optional
 
 
@@ -344,6 +345,161 @@ def append_new_deals(
     })
 
 
+def append_rows_with_rate_limit(
+    ws: gspread.Worksheet,
+    rows: list[list],
+    delay: float = 1.0
+) -> None:
+    """
+    Append multiple rows to worksheet using batch API with rate limiting.
+
+    Uses ws.append_rows() for efficient batch writing.
+    Adds delay after write to stay under 60 writes/minute quota.
+
+    Args:
+        ws: Worksheet to write to
+        rows: List of row data (each row is a list of values)
+        delay: Seconds to wait after write (default: 1.0)
+
+    Raises:
+        gspread.exceptions.APIError: If write fails
+    """
+    if not rows:
+        return
+
+    # Batch write all rows at once
+    ws.append_rows(rows, value_input_option='RAW')
+
+    # Rate limiting: Wait 1 second to stay under 60 writes/min
+    time.sleep(delay)
+
+
+def save_checkpoint(
+    new_deals: list[dict],
+    excluded_deals: list[dict],
+    unverified_deals: list[dict],
+    scan_period: str,
+    start_date: str,
+    end_date: str,
+    validation_stats: dict,
+    total_companies: int,
+    test_mode: bool = False
+) -> str:
+    """
+    Save scan results to checkpoint JSON file.
+
+    Creates checkpoint file in data/checkpoints/ directory for retry/recovery.
+
+    Args:
+        new_deals: List of verified new deals
+        excluded_deals: List of excluded deals
+        unverified_deals: List of unverified deals
+        scan_period: Period string (e.g., "2025-01", "last_week")
+        start_date: Scan start date (YYYY-MM-DD)
+        end_date: Scan end date (YYYY-MM-DD)
+        validation_stats: Dict with verified/re_sourced/unverified counts
+        total_companies: Number of companies scanned
+        test_mode: Whether scan was in test mode
+
+    Returns:
+        Path to created checkpoint file
+
+    Raises:
+        OSError: If checkpoint directory cannot be created or file cannot be written
+    """
+    # Ensure checkpoint directory exists
+    checkpoint_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "data", "checkpoints"
+    )
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Generate checkpoint filename
+    timestamp = datetime.now().isoformat().replace(":", "-")
+    filename = f"checkpoint_{scan_period}_{timestamp}.json"
+    filepath = os.path.join(checkpoint_dir, filename)
+
+    # Build checkpoint structure
+    checkpoint = {
+        "metadata": {
+            "scan_period": scan_period,
+            "scan_dates": {
+                "start_date": start_date,
+                "end_date": end_date
+            },
+            "timestamp": datetime.now().isoformat(),
+            "total_companies_scanned": total_companies,
+            "test_mode": test_mode
+        },
+        "deals": {
+            "new_deals": new_deals,
+            "excluded_deals": excluded_deals,
+            "unverified_deals": unverified_deals
+        },
+        "write_progress": {
+            "new_deals_written": False,
+            "excluded_deals_written": False,
+            "unverified_deals_written": False,
+            "executive_summary_written": False,
+            "completed": False,
+            "last_write_timestamp": None,
+            "error_log": []
+        },
+        "validation_stats": validation_stats
+    }
+
+    # Write checkpoint file (pretty-printed for debugging)
+    with open(filepath, 'w') as f:
+        json.dump(checkpoint, f, indent=2, ensure_ascii=False)
+
+    return filepath
+
+
+def update_checkpoint_progress(
+    checkpoint_path: str,
+    step: str,
+    success: bool = True,
+    error: str = None
+) -> None:
+    """
+    Update checkpoint file with write progress.
+
+    Args:
+        checkpoint_path: Path to checkpoint JSON file
+        step: Step that completed ("new_deals", "excluded_deals", "unverified_deals", "executive_summary")
+        success: Whether step succeeded
+        error: Error message if step failed
+    """
+    with open(checkpoint_path, 'r') as f:
+        checkpoint = json.load(f)
+
+    # Update progress
+    step_key = f"{step}_written"
+    if step_key in checkpoint["write_progress"]:
+        checkpoint["write_progress"][step_key] = success
+        checkpoint["write_progress"]["last_write_timestamp"] = datetime.now().isoformat()
+
+        if not success and error:
+            checkpoint["write_progress"]["error_log"].append({
+                "step": step,
+                "timestamp": datetime.now().isoformat(),
+                "error": error
+            })
+
+        # Check if all steps completed
+        all_done = (
+            checkpoint["write_progress"]["new_deals_written"] and
+            checkpoint["write_progress"]["excluded_deals_written"] and
+            checkpoint["write_progress"]["unverified_deals_written"] and
+            checkpoint["write_progress"]["executive_summary_written"]
+        )
+        checkpoint["write_progress"]["completed"] = all_done
+
+    # Write back
+    with open(checkpoint_path, 'w') as f:
+        json.dump(checkpoint, f, indent=2, ensure_ascii=False)
+
+
 def append_excluded_deals(
     spreadsheet: gspread.Spreadsheet,
     excluded_deals: list[dict],
@@ -351,6 +507,8 @@ def append_excluded_deals(
 ) -> None:
     """
     Append PE/financial/IPO deals to the Excluded tab.
+
+    Uses batch write for efficiency (1 API call instead of N calls).
 
     Args:
         spreadsheet: gspread Spreadsheet object
@@ -363,8 +521,10 @@ def append_excluded_deals(
     ws = spreadsheet.worksheet("Excluded (Non-Strategic)")
     today = date.today().isoformat()
 
+    # Build all rows first
+    rows_to_append = []
     for deal in excluded_deals:
-        ws.append_row([
+        row = [
             deal.get("acquiror", ""),
             deal.get("target", ""),
             deal.get("deal_value", ""),
@@ -373,7 +533,11 @@ def append_excluded_deals(
             deal.get("exclusion_reason", ""),
             today,
             scan_period,
-        ])
+        ]
+        rows_to_append.append(row)
+
+    # Batch write with rate limiting
+    append_rows_with_rate_limit(ws, rows_to_append)
 
 
 def append_unverified_deals(
@@ -383,6 +547,8 @@ def append_unverified_deals(
 ) -> None:
     """
     Append deals with no valid source to the Unverified tab.
+
+    Uses batch write for efficiency (1 API call instead of N calls).
 
     Args:
         spreadsheet: gspread Spreadsheet object
@@ -395,8 +561,10 @@ def append_unverified_deals(
     ws = spreadsheet.worksheet("Unverified")
     today = date.today().isoformat()
 
+    # Build all rows first
+    rows_to_append = []
     for deal in unverified_deals:
-        ws.append_row([
+        row = [
             deal.get("acquiror", ""),
             deal.get("target", ""),
             deal.get("deal_status", ""),
@@ -406,7 +574,11 @@ def append_unverified_deals(
             deal.get("validation_failure_reason", ""),
             today,
             scan_period,
-        ])
+        ]
+        rows_to_append.append(row)
+
+    # Batch write with rate limiting
+    append_rows_with_rate_limit(ws, rows_to_append)
 
 
 def update_executive_summary(
