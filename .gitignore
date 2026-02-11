@@ -72,3 +72,4 @@ data/*.xlsx
 
 # Backup files
 data/backups/
+.github/workflows/
