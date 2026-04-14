@@ -17,6 +17,11 @@ import re
 import time
 from typing import Tuple, Optional, Union
 
+try:
+    from reinforcement import get_prompt_injection
+except ImportError:
+    def get_prompt_injection(tier): return ""
+
 
 # PE/financial buyer blocklist (hardcoded safety net)
 PE_FIRMS = {
@@ -26,6 +31,18 @@ PE_FIRMS = {
     "hellman & friedman", "genstar", "platinum equity", "leonard green",
     "berkshire hathaway", "sovereign wealth fund",
 }
+
+
+def is_fatal_api_error(error: Exception) -> bool:
+    """Check if an API error is fatal (billing, auth) vs transient (rate limit)."""
+    msg = str(error).lower()
+    return any(s in msg for s in [
+        "credit balance is too low",
+        "billing",
+        "authentication",
+        "invalid api key",
+        "account has been disabled",
+    ])
 
 
 def build_tier1_queries(start_date: str, end_date: str) -> list[str]:
@@ -82,12 +99,23 @@ def build_tier1_queries(start_date: str, end_date: str) -> list[str]:
         "major industrial acquisition announced",
         "largest industrial mergers",
         "industrial spin-off divestiture",
+        # JV / investment / asset transfer queries
+        "oil gas joint venture formed",
+        "mining joint venture partnership",
+        "chemical joint venture new entity",
+        "industrial joint venture facilities",
+        "energy company asset transfer",
+        "oil gas asset swap deal",
+        "infrastructure investment partnership",
+        "industrial consortium formed",
+        "midstream joint venture pipeline",
+        "utility partnership investment",
     ]
 
     return [f"{sector} {date_suffix}" for sector in SECTORS]
 
 
-def run_tier1_scans(start_date: str, end_date: str) -> list[dict]:
+def run_tier1_scans(start_date: str, end_date: str, max_uses: int = 5) -> list[dict]:
     """
     Tier 1: Industry sector scans.
 
@@ -96,6 +124,7 @@ def run_tier1_scans(start_date: str, end_date: str) -> list[dict]:
     Args:
         start_date: Start date (YYYY-MM-DD)
         end_date: End date (YYYY-MM-DD)
+        max_uses: Max web search uses per query (default 5, exhaustive 10)
 
     Returns:
         List of deal dicts
@@ -103,17 +132,19 @@ def run_tier1_scans(start_date: str, end_date: str) -> list[dict]:
     client = anthropic.Anthropic()  # Uses ANTHROPIC_API_KEY env var
 
     system_prompt = f"""You are an M&A research analyst specializing in industrial sectors.
-Search for mergers, acquisitions, divestitures, and spin-offs in the specified industry sector.
+Search for mergers, acquisitions, divestitures, spin-offs, joint ventures, asset transfers,
+significant investments/stakes, and consortium formations in the specified industry sector.
 
 TIME PERIOD: Only include deals with activity between {start_date} and {end_date}.
 "Activity" means: rumor first reported, deal announced, or deal closed within this window.
 Do NOT include deals whose only activity was outside this date range.
 
 For each deal you find, extract:
-- acquiror: Company making the acquisition
-- target: Company being acquired / divested
+- acquiror: Company making the acquisition (for JVs: Party A alphabetically first)
+- target: Company being acquired / divested (for JVs: Party B alphabetically second)
+- deal_type: Acquisition, Merger, Divestiture, Spin-off, Joint Venture, Asset Transfer, or Investment/Stake
 - deal_status: Rumored / Announced / Closed
-- description: 1-2 sentence factual summary
+- description: 1-2 sentence factual summary. For joint ventures: include the JV entity name and ownership split.
 - deal_value: Approximate deal value if known (e.g., "$53B" or "Undisclosed")
 - date: When was it rumored/announced/closed? (YYYY-MM-DD)
 - source: Publication name
@@ -123,7 +154,6 @@ IMPORTANT FILTERS - EXCLUDE these:
 - Deals where the buyer is a PE firm, hedge fund, or financial investor
   (Carlyle, KKR, Apollo, Blackstone, Berkshire Hathaway, TPG, etc.)
 - Technology/software companies (Google, Microsoft, Apple, Meta, Amazon, etc.)
-- Joint ventures (no change in ownership)
 - IPOs or public listings
 - Internal restructurings where ownership doesn't truly change
 
@@ -135,6 +165,10 @@ industrial gases, or agribusiness.
 DO NOT include technology or software sector deals.
 
 Return results as a JSON array. If no relevant deals found, return []."""
+
+    rl_context = get_prompt_injection("tier1")
+    if rl_context:
+        system_prompt += f"\n\n{rl_context}"
 
     queries = build_tier1_queries(start_date, end_date)
     all_deals = []
@@ -152,12 +186,12 @@ Return results as a JSON array. If no relevant deals found, return []."""
                 tools=[{
                     "type": "web_search_20250305",
                     "name": "web_search",
-                    "max_uses": 5
+                    "max_uses": max_uses
                 }],
                 system=system_prompt,
                 messages=[{
                     "role": "user",
-                    "content": f"Find all M&A deals matching: {query}. Return as JSON array."
+                    "content": f"Find all M&A and investment deals matching: {query}. Return as JSON array."
                 }]
             )
 
@@ -172,22 +206,31 @@ Return results as a JSON array. If no relevant deals found, return []."""
 
         except Exception as e:
             print(f"    Error: {e}")
+            if is_fatal_api_error(e):
+                print(f"\n    FATAL: {e}")
+                print(f"    Stopping Tier 1 early. {len(all_deals)} deals collected so far.")
+                break
 
     print(f"\nTier 1 complete: {len(all_deals)} total deals")
     return all_deals
 
 
-def run_tier2_scans(companies: list[dict], start_date: str, end_date: str) -> list[dict]:
+def run_tier2_scans(companies: list[dict], start_date: str, end_date: str,
+                    batch_size: int = 3, max_uses: int = 5,
+                    label: str = "C&D") -> list[dict]:
     """
     Tier 2: Company batch verification.
 
     Check specific PG accounts for M&A activity.
-    Split companies into batches of ~20.
+    Split companies into batches.
 
     Args:
         companies: List of company dicts from matcher.load_company_list()
         start_date: Start date (YYYY-MM-DD)
         end_date: End date (YYYY-MM-DD)
+        batch_size: Number of companies per batch (default 3, exhaustive 2)
+        max_uses: Max web search uses per batch (default 5, exhaustive 10)
+        label: Label for console output (default "C&D")
 
     Returns:
         List of deal dicts
@@ -195,8 +238,9 @@ def run_tier2_scans(companies: list[dict], start_date: str, end_date: str) -> li
     client = anthropic.Anthropic()
 
     system_prompt = f"""You are an M&A research analyst. I will give you a list of companies.
-For each company, search for mergers, acquisitions, divestitures, or spin-offs
-they have been involved in (as either buyer or seller/target) between {start_date} and {end_date}.
+For each company, search for mergers, acquisitions, divestitures, spin-offs,
+joint ventures, asset transfers/swaps, significant investments or stakes,
+and consortium formations they have been involved in between {start_date} and {end_date}.
 
 CRITICAL: Include ALL deals where ANY of these dates fall within the range:
 - Date rumored
@@ -208,13 +252,16 @@ Example: A deal announced in Oct 2023 but closed in May 2024 MUST be included.
 Apply the same filters:
 - EXCLUDE PE/financial buyers
 - EXCLUDE technology/software companies (Google, Microsoft, Apple, Meta, Amazon, etc.)
-- EXCLUDE joint ventures, IPOs, internal restructurings
-- Only INCLUDE strategic/competitive M&A in industrial sectors
+- EXCLUDE IPOs, internal restructurings
+- Only INCLUDE strategic/competitive activity in industrial sectors
+
+For JVs: set role to 'Partner', list counterparty as the other partner, include JV entity name and ownership % in description.
 
 For each deal found, return:
 - company_from_list: Company from the list that matched
-- role: Acquiror or Target
+- role: Acquiror, Target, or Partner
 - counterparty: The other company in the deal
+- deal_type: Acquisition, Merger, Divestiture, Spin-off, Joint Venture, Asset Transfer, or Investment/Stake
 - deal_status: Rumored / Announced / Closed
 - description: 1-2 sentence summary
 - deal_value: If known
@@ -224,13 +271,15 @@ For each deal found, return:
 
 Return as JSON array. If no deals found for any company, return []."""
 
-    # Split into batches of 3 (more thorough, catches major deals)
-    BATCH_SIZE = 3
-    batches = [companies[i:i + BATCH_SIZE] for i in range(0, len(companies), BATCH_SIZE)]
+    rl_context = get_prompt_injection("tier2")
+    if rl_context:
+        system_prompt += f"\n\n{rl_context}"
+
+    batches = [companies[i:i + batch_size] for i in range(0, len(companies), batch_size)]
 
     all_deals = []
 
-    print(f"\nTIER 2: Company Batch Verification ({len(batches)} batches)")
+    print(f"\nTIER 2 ({label}): Company Batch Verification ({len(batches)} batches, {max_uses} searches each)")
     print("=" * 60)
 
     for i, batch in enumerate(batches, 1):
@@ -246,12 +295,12 @@ Return as JSON array. If no deals found for any company, return []."""
                 tools=[{
                     "type": "web_search_20250305",
                     "name": "web_search",
-                    "max_uses": 5
+                    "max_uses": max_uses
                 }],
                 system=system_prompt,
                 messages=[{
                     "role": "user",
-                    "content": f"Check these companies for M&A activity between {start_date} and {end_date}:\n{numbered_list}"
+                    "content": f"Check these companies for M&A and investment activity between {start_date} and {end_date}:\n{numbered_list}"
                 }]
             )
 
@@ -264,6 +313,7 @@ Return as JSON array. If no deals found for any company, return []."""
                         normalized.append({
                             "acquiror": deal.get("company_from_list", ""),
                             "target": deal.get("counterparty", ""),
+                            "deal_type": deal.get("deal_type", ""),
                             "deal_status": deal.get("deal_status", ""),
                             "description": deal.get("description", ""),
                             "deal_value": deal.get("deal_value", ""),
@@ -275,6 +325,23 @@ Return as JSON array. If no deals found for any company, return []."""
                         normalized.append({
                             "acquiror": deal.get("counterparty", ""),
                             "target": deal.get("company_from_list", ""),
+                            "deal_type": deal.get("deal_type", ""),
+                            "deal_status": deal.get("deal_status", ""),
+                            "description": deal.get("description", ""),
+                            "deal_value": deal.get("deal_value", ""),
+                            "date": deal.get("date", ""),
+                            "source": deal.get("source", ""),
+                            "source_link": deal.get("source_link", "")
+                        })
+                    elif deal.get("role") == "Partner":
+                        # JV/partnership: assign alphabetically for consistency
+                        company = deal.get("company_from_list", "")
+                        counterparty = deal.get("counterparty", "")
+                        parties = sorted([company, counterparty], key=str.lower)
+                        normalized.append({
+                            "acquiror": parties[0],
+                            "target": parties[1],
+                            "deal_type": deal.get("deal_type", "Joint Venture"),
                             "deal_status": deal.get("deal_status", ""),
                             "description": deal.get("description", ""),
                             "deal_value": deal.get("deal_value", ""),
@@ -292,8 +359,168 @@ Return as JSON array. If no deals found for any company, return []."""
 
         except Exception as e:
             print(f"    Error: {e}")
+            if is_fatal_api_error(e):
+                print(f"\n    FATAL: {e}")
+                print(f"    Stopping Tier 2 ({label}) early. {len(all_deals)} deals collected so far.")
+                break
 
-    print(f"\nTier 2 complete: {len(all_deals)} total deals")
+    print(f"\nTier 2 ({label}) complete: {len(all_deals)} total deals")
+    return all_deals
+
+
+def run_tier2_ab_scans(companies: list[dict], start_date: str, end_date: str,
+                       max_uses: int = 20) -> list[dict]:
+    """
+    Tier 2 (A&B): Exhaustive individual company scans.
+
+    Each A&B account gets its own dedicated API call with more web searches
+    to catch smaller deals (JVs, asset swaps, minority stakes) that get
+    crowded out in batched scans.
+
+    Args:
+        companies: List of A&B company dicts from matcher
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        max_uses: Max web search uses per company (default 20)
+
+    Returns:
+        List of deal dicts in standard format
+    """
+    client = anthropic.Anthropic()
+
+    system_prompt = f"""You are an M&A research analyst conducting an EXHAUSTIVE search for a single company.
+Find EVERY deal this company has been involved in between {start_date} and {end_date}.
+
+Do NOT just report the biggest headline deals. You must also find:
+- Joint ventures (JVs) — even small ones involving a handful of facilities
+- Asset swaps and asset transfers
+- Minority stakes and strategic investments
+- Facility-level transactions (e.g., acquiring or divesting individual plants/refineries)
+- Consortium formations and partnerships
+- Spin-offs and carve-outs
+
+CRITICAL: Include ALL deals where ANY of these dates fall within the range:
+- Date rumored
+- Date announced
+- Date closed (MOST IMPORTANT - capture deals announced earlier but closed in this period)
+
+Example: A deal announced in Oct 2023 but closed in May 2024 MUST be included.
+
+Apply the same filters:
+- EXCLUDE PE/financial buyers
+- EXCLUDE technology/software companies (Google, Microsoft, Apple, Meta, Amazon, etc.)
+- EXCLUDE IPOs, internal restructurings
+- Only INCLUDE strategic/competitive activity in industrial sectors
+
+For JVs: set role to 'Partner', list counterparty as the other partner, include JV entity name and ownership % in description.
+
+For each deal found, return:
+- company_from_list: Company from the list that matched
+- role: Acquiror, Target, or Partner
+- counterparty: The other company in the deal
+- deal_type: Acquisition, Merger, Divestiture, Spin-off, Joint Venture, Asset Transfer, or Investment/Stake
+- deal_status: Rumored / Announced / Closed
+- description: 1-2 sentence summary
+- deal_value: If known
+- date: YYYY-MM-DD
+- source: Publication name
+- source_link: Direct URL
+
+Return as JSON array. If no deals found, return []."""
+
+    rl_context = get_prompt_injection("tier2_ab")
+    if rl_context:
+        system_prompt += f"\n\n{rl_context}"
+
+    all_deals = []
+
+    print(f"\nTIER 2 (A&B): Exhaustive Individual Scans ({len(companies)} companies, {max_uses} searches each)")
+    print("=" * 60)
+
+    for i, company in enumerate(companies, 1):
+        name = company["clean_name"]
+        print(f"  [{i}/{len(companies)}] {name}")
+
+        try:
+            response = client.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=4096,
+                tools=[{
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": max_uses
+                }],
+                system=system_prompt,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Search exhaustively for ALL M&A activity, joint ventures, asset deals, "
+                        f"and investments involving {name} between {start_date} and {end_date}. "
+                        f"Leave no stone unturned — include even small facility-level transactions."
+                    )
+                }]
+            )
+
+            deals = extract_json_from_response(response)
+            if deals:
+                # Normalize Tier 2 format to standard format (same logic as run_tier2_scans)
+                normalized = []
+                for deal in deals:
+                    if deal.get("role") == "Acquiror":
+                        normalized.append({
+                            "acquiror": deal.get("company_from_list", ""),
+                            "target": deal.get("counterparty", ""),
+                            "deal_type": deal.get("deal_type", ""),
+                            "deal_status": deal.get("deal_status", ""),
+                            "description": deal.get("description", ""),
+                            "deal_value": deal.get("deal_value", ""),
+                            "date": deal.get("date", ""),
+                            "source": deal.get("source", ""),
+                            "source_link": deal.get("source_link", "")
+                        })
+                    elif deal.get("role") == "Target":
+                        normalized.append({
+                            "acquiror": deal.get("counterparty", ""),
+                            "target": deal.get("company_from_list", ""),
+                            "deal_type": deal.get("deal_type", ""),
+                            "deal_status": deal.get("deal_status", ""),
+                            "description": deal.get("description", ""),
+                            "deal_value": deal.get("deal_value", ""),
+                            "date": deal.get("date", ""),
+                            "source": deal.get("source", ""),
+                            "source_link": deal.get("source_link", "")
+                        })
+                    elif deal.get("role") == "Partner":
+                        company_name = deal.get("company_from_list", "")
+                        counterparty = deal.get("counterparty", "")
+                        parties = sorted([company_name, counterparty], key=str.lower)
+                        normalized.append({
+                            "acquiror": parties[0],
+                            "target": parties[1],
+                            "deal_type": deal.get("deal_type", "Joint Venture"),
+                            "deal_status": deal.get("deal_status", ""),
+                            "description": deal.get("description", ""),
+                            "deal_value": deal.get("deal_value", ""),
+                            "date": deal.get("date", ""),
+                            "source": deal.get("source", ""),
+                            "source_link": deal.get("source_link", "")
+                        })
+
+                # Filter out PE deals
+                normalized = [d for d in normalized if not is_pe_buyer(d.get("acquiror", ""))]
+                all_deals.extend(normalized)
+                print(f"    Found {len(normalized)} deals")
+
+            time.sleep(10)  # Rate limiting
+
+        except Exception as e:
+            print(f"    Error: {e}")
+            if is_fatal_api_error(e):
+                print(f"\n    FATAL: {e}")
+                print(f"    Stopping Tier 2 (A&B) early. {len(all_deals)} deals collected so far.")
+                break
+
+    print(f"\nTier 2 (A&B) complete: {len(all_deals)} total deals")
     return all_deals
 
 
@@ -315,23 +542,34 @@ def run_tier3_verification(candidate: dict) -> dict:
     acquiror = candidate.get("acquiror", "")
     target = candidate.get("target", "")
 
-    system_prompt = f"""You are verifying a specific M&A transaction. Search for detailed,
+    deal_type = candidate.get("deal_type", "")
+    deal_context = f"Deal to verify: {acquiror} acquiring/merging with {target}"
+    if deal_type == "Joint Venture":
+        deal_context = f"Deal to verify: {acquiror} and {target} forming a joint venture"
+
+    system_prompt = f"""You are verifying a specific M&A or investment transaction. Search for detailed,
 authoritative information about this deal.
 
-Deal to verify: {acquiror} acquiring/merging with {target}
+{deal_context}
 
 Extract ALL of the following fields:
-1. acquiror (full legal name)
-2. target (full legal name)
-3. deal_status (Rumored / Announced / Closed)
-4. description (2-3 sentence factual summary)
-5. date_rumor (YYYY-MM-DD or null)
-6. date_announced (YYYY-MM-DD or null)
-7. date_closed (YYYY-MM-DD or null)
-8. deal_value (e.g., "$53B" or "Undisclosed")
-9. source (publication name)
-10. source_link - SEE CRITICAL RULES BELOW
-11. sector (Oil & Gas, Mining, Utilities, Manufacturing, Chemicals, etc.)
+1. acquiror (full legal name; for JVs: partner alphabetically first)
+2. target (full legal name; for JVs: partner alphabetically second)
+3. deal_type (Acquisition, Merger, Divestiture, Spin-off, Joint Venture, Asset Transfer, or Investment/Stake)
+4. deal_status (Rumored / Announced / Closed)
+5. description (2-3 sentence factual summary)
+6. date_rumor (YYYY-MM-DD or null)
+7. date_announced (YYYY-MM-DD or null)
+8. date_closed (YYYY-MM-DD or null)
+9. deal_value (e.g., "$53B" or "Undisclosed")
+10. source (publication name)
+11. source_link - SEE CRITICAL RULES BELOW
+12. sector (Oil & Gas, Mining, Utilities, Manufacturing, Chemicals, etc.)
+
+For joint ventures, also extract:
+- jv_entity_name: Name of the JV entity (e.g., "Adura") or null
+- ownership_split: Ownership percentages (e.g., "50/50") or null
+- facilities_contributed: Number/description of facilities being contributed or operated
 
 === CRITICAL RULES FOR SOURCE LINK ===
 - The source_link MUST be a URL you found in your web search results.
@@ -355,9 +593,13 @@ Correct approach:
 If you cannot verify this deal with a credible source, return
 {{"verified": false, "reason": "..."}}.
 
-Apply all exclusion filters (PE buyers, technology/software companies, JVs, IPOs, restructurings).
+Apply all exclusion filters (PE buyers, technology/software companies, IPOs, restructurings).
 
 Return as a single JSON object."""
+
+    rl_context = get_prompt_injection("tier3")
+    if rl_context:
+        system_prompt += f"\n\n{rl_context}"
 
     try:
         response = client.messages.create(
@@ -371,7 +613,7 @@ Return as a single JSON object."""
             system=system_prompt,
             messages=[{
                 "role": "user",
-                "content": f"Verify this deal and extract all fields: {acquiror} acquiring/merging with {target}"
+                "content": f"Verify this deal and extract all fields: {deal_context}"
             }]
         )
 
@@ -402,6 +644,10 @@ Return as a single JSON object."""
             deal["clean_name"] = candidate["clean_name"]
         if "pg_match_side" in candidate:
             deal["pg_match_side"] = candidate["pg_match_side"]
+
+        # Preserve deal_type from candidate as fallback if Tier 3 didn't return it
+        if not deal.get("deal_type") and candidate.get("deal_type"):
+            deal["deal_type"] = candidate["deal_type"]
 
         return deal
 
@@ -456,6 +702,8 @@ def run_tier4_research(deal: dict) -> str:
     acquiror = deal.get("acquiror", "")
     target = deal.get("target", "")
     sector = deal.get("sector", "")
+    deal_type = deal.get("deal_type", "Acquisition")
+    is_jv = deal_type == "Joint Venture"
 
     # Check which side is the PG customer
     pg_match_side = deal.get("pg_match_side", "")  # "acquiror" or "target"
@@ -472,17 +720,36 @@ def run_tier4_research(deal: dict) -> str:
     else:
         pg_context = f"\n\nIMPORTANT: Neither {acquiror} nor {target} are confirmed Prometheus Group customers."
 
+    # Build deal description based on deal type
+    if is_jv:
+        jv_entity = deal.get("jv_entity_name", "")
+        jv_label = f" (JV entity: {jv_entity})" if jv_entity else ""
+        deal_desc = f"{acquiror} and {target} forming a joint venture{jv_label}"
+        research_target = f"the JV entity{jv_label} and both partners' contributed facilities"
+    else:
+        deal_desc = f"{acquiror} acquiring {target}"
+        research_target = f"the TARGET company ({target})"
+
+    jv_classification_rules = """
+   For JOINT VENTURES specifically:
+   - OFFENSIVE: If a PG customer is a partner AND the JV creates new facilities
+     or brings together assets that would need maintenance software.
+   - DEFENSIVE: If a PG customer's assets are being contributed to a JV with
+     a non-PG partner who may bring different software/processes.
+   - MONITOR: Default for JVs where the relationship impact is unclear.""" if is_jv else ""
+
     system_prompt = """You are a sales intelligence analyst for Prometheus Group, which sells
 planning & scheduling software for maintenance of heavy industrial assets.
 
-For the following M&A deal, research the TARGET company's physical
+For the following deal, research {research_target}'s physical
 operations and classify the opportunity:
 
-Deal: {acquiror} acquiring {target}
+Deal: {deal_desc}
+Deal Type: {deal_type}
 Sector: {sector}{pg_context}
 
 Research and provide:
-1. FACILITY DETAILS: List the target's known facilities - plants,
+1. FACILITY DETAILS: List known facilities - plants,
    refineries, mines, processing facilities, manufacturing sites,
    power plants, pipelines, etc. Be specific with names and locations.
 
@@ -498,10 +765,20 @@ Research and provide:
 
    - MONITOR: For investments, minority stakes, joint ventures, or deals
      where neither classification clearly applies.
-
+{jv_classification_rules}
 3. RECOMMENDED ACTION: 1-2 sentences for the sales team.
 
 Return as JSON with fields: facility_details, classification, recommended_action."""
+
+    formatted_prompt = system_prompt.format(
+        acquiror=acquiror, target=target, sector=sector,
+        pg_context=pg_context, deal_desc=deal_desc, deal_type=deal_type,
+        research_target=research_target, jv_classification_rules=jv_classification_rules
+    )
+
+    rl_context = get_prompt_injection("tier4")
+    if rl_context:
+        formatted_prompt += f"\n\n{rl_context}"
 
     try:
         response = client.messages.create(
@@ -512,10 +789,10 @@ Return as JSON with fields: facility_details, classification, recommended_action
                 "name": "web_search",
                 "max_uses": 5
             }],
-            system=system_prompt.format(acquiror=acquiror, target=target, sector=sector, pg_context=pg_context),
+            system=formatted_prompt,
             messages=[{
                 "role": "user",
-                "content": f"Research facilities and classify opportunity for: {acquiror} acquiring {target}"
+                "content": f"Research facilities and classify opportunity for: {deal_desc}"
             }]
         )
 

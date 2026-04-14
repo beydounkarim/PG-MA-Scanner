@@ -109,8 +109,8 @@ def run_pre_validation_qa(deals: list[dict]) -> dict:
 
         parsed = urlparse(url)
         path = parsed.path.lower()
-        acquiror = deal.get("acquiror", "").lower()
-        target = deal.get("target", "").lower()
+        acquiror = (deal.get("acquiror") or "").lower()
+        target = (deal.get("target") or "").lower()
 
         # Extract first words for matching
         acquiror_short = acquiror.split()[0] if acquiror else ""
@@ -385,6 +385,8 @@ def _name_variations(company_name: str) -> list[str]:
     Examples:
         "Hess Corporation" → ["hess corporation", "hess corp", "hess"]
     """
+    if not company_name:
+        return [""]
     name = company_name.lower().strip()
     variations = [name]
 
@@ -432,6 +434,11 @@ def find_replacement_source(
         - source_link: str | None (URL)
         - confidence: str (high/medium/low/none)
     """
+    try:
+        from reinforcement import get_prompt_injection
+    except ImportError:
+        def get_prompt_injection(tier): return ""
+
     system_prompt = """You are finding a credible news source for a specific M&A deal.
 Search for the deal and return ONLY URLs that appeared in your search results.
 
@@ -441,6 +448,10 @@ Return a JSON object with:
 - "sources": array of {"url": "...", "title": "...", "publication": "..."}
 - Include up to 3 candidate sources, ranked by credibility
   (press releases > Reuters/Bloomberg > trade publications > other)"""
+
+    rl_context = get_prompt_injection("source_validation")
+    if rl_context:
+        system_prompt += f"\n\n{rl_context}"
 
     user_message = (
         f"Find a credible source URL for this deal: "
@@ -517,8 +528,8 @@ def validate_deal_source(deal: dict, client) -> dict:
         Modified deal dict with validation_details and source_validation fields
     """
     url = deal.get("source_link")
-    acquiror = deal.get("acquiror", "")
-    target = deal.get("target", "")
+    acquiror = deal.get("acquiror") or ""
+    target = deal.get("target") or ""
 
     deal["validation_details"] = {}
 
@@ -568,37 +579,56 @@ def validate_deal_source(deal: dict, client) -> dict:
     return deal
 
 
+def _validate_one(args):
+    """Worker function for parallel validation."""
+    idx, total, deal, client = args
+    acquiror = deal.get("acquiror") or ""
+    target = deal.get("target") or ""
+    print(f"Validating source [{idx}/{total}]: {acquiror} → {target}")
+    try:
+        return validate_deal_source(deal, client)
+    except Exception as e:
+        print(f"  Error validating {acquiror} → {target}: {e}")
+        deal["source_validation"] = "⚠️ Unverified"
+        deal["validation_failure_reason"] = f"Validation error: {e}"
+        return deal
+
+
 def validate_all_deals(
     deals: list[dict],
     client,
-    delay: float = 1.0
+    delay: float = 1.0,
+    max_workers: int = 5
 ) -> Tuple[list, list]:
     """
-    Validate all deals and split into verified vs unverified.
+    Validate all deals in parallel and split into verified vs unverified.
 
     Args:
         deals: List of deal dicts
         client: Anthropic client
         delay: Delay between validations in seconds (rate limiting)
+        max_workers: Number of parallel validation threads
 
     Returns:
         Tuple of (verified_deals, unverified_deals)
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     verified = []
     unverified = []
 
-    for i, deal in enumerate(deals):
-        print(f"Validating source [{i+1}/{len(deals)}]: "
-              f"{deal.get('acquiror')} → {deal.get('target')}")
+    # Build work items
+    work = [(i + 1, len(deals), deal, client) for i, deal in enumerate(deals)]
 
-        validated = validate_deal_source(deal, client)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_validate_one, w): w for w in work}
 
-        if validated["source_validation"] in ("✓ Verified", "🔄 Re-sourced"):
-            verified.append(validated)
-        else:
-            unverified.append(validated)
-
-        time.sleep(delay)
+        for future in as_completed(futures):
+            validated = future.result()
+            if validated["source_validation"] in ("✓ Verified", "🔄 Re-sourced"):
+                verified.append(validated)
+            else:
+                unverified.append(validated)
 
     # Print summary
     v_count = sum(1 for d in verified if d["source_validation"] == "✓ Verified")

@@ -2,6 +2,9 @@
 """
 Clean Sheet Formatting - Remove highlights and fix text formatting.
 
+Works with the date-grouped sheet structure. Preserves section headers
+("═══" rows) with gray formatting, and uses blue (#2F5496) header style.
+
 Usage:
     python src/clean_formatting.py
 """
@@ -15,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
-from sheets_output import open_sheet
+from sheets_output import open_sheet, HEADER_BG, HEADER_TEXT, SECTION_BG, SECTION_TEXT
 
 
 def clean_sheet_formatting():
@@ -23,8 +26,8 @@ def clean_sheet_formatting():
     Clean up sheet formatting:
     - Remove all background colors (yellow highlights, etc.)
     - Set text to black, normal weight
-    - Keep section headers with subtle gray background
-    - Keep header row formatted
+    - Keep section headers ("═══" rows) with gray background
+    - Keep header row with blue background
     """
     print("Connecting to Google Sheets...")
     spreadsheet = open_sheet()
@@ -35,7 +38,7 @@ def clean_sheet_formatting():
     num_rows = len(all_rows)
     num_cols = len(all_rows[0]) if all_rows else 0
 
-    print(f"✓ Loaded sheet with {num_rows} rows and {num_cols} columns\n")
+    print(f"Loaded sheet with {num_rows} rows and {num_cols} columns\n")
 
     # Define ranges
     end_col_letter = chr(ord('A') + num_cols - 1)
@@ -43,41 +46,29 @@ def clean_sheet_formatting():
 
     print("Cleaning formatting...")
 
-    # Step 1: Clear all formatting from entire sheet (except values)
+    # Step 1: Clear all formatting from entire sheet
     print("  Removing all background colors and text formatting...")
     ws.format(full_range, {
-        'backgroundColor': {'red': 1, 'green': 1, 'blue': 1},  # White background
+        'backgroundColor': {'red': 1, 'green': 1, 'blue': 1},
         'textFormat': {
-            'foregroundColor': {'red': 0, 'green': 0, 'blue': 0},  # Black text
+            'foregroundColor': {'red': 0, 'green': 0, 'blue': 0},
             'bold': False,
             'fontSize': 10
         }
     })
 
-    # Step 2: Format title row (row 1)
-    print("  Formatting title row...")
-    ws.format(f'A1:{end_col_letter}1', {
-        'backgroundColor': {'red': 0.95, 'green': 0.95, 'blue': 0.95},  # Light gray
-        'textFormat': {
-            'foregroundColor': {'red': 0, 'green': 0, 'blue': 0},
-            'bold': True,
-            'fontSize': 12
-        },
-        'horizontalAlignment': 'CENTER'
-    })
-
-    # Step 3: Format header row (row 3)
+    # Step 2: Format header row (row 1) with blue
     print("  Formatting header row...")
-    ws.format(f'A3:{end_col_letter}3', {
-        'backgroundColor': {'red': 0.85, 'green': 0.85, 'blue': 0.85},  # Medium gray
+    ws.format(f'A1:{end_col_letter}1', {
+        'backgroundColor': HEADER_BG,
         'textFormat': {
-            'foregroundColor': {'red': 0, 'green': 0, 'blue': 0},
+            'foregroundColor': HEADER_TEXT,
             'bold': True,
             'fontSize': 10
-        }
+        },
     })
 
-    # Step 4: Format section headers (rows that start with "═══")
+    # Step 3: Format section headers (rows starting with "═══")
     print("  Formatting section headers...")
     section_header_rows = []
     for i, row in enumerate(all_rows, start=1):
@@ -86,150 +77,79 @@ def clean_sheet_formatting():
 
     for row_num in section_header_rows:
         ws.format(f'A{row_num}:{end_col_letter}{row_num}', {
-            'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9},  # Light gray
+            'backgroundColor': SECTION_BG,
             'textFormat': {
-                'foregroundColor': {'red': 0.2, 'green': 0.2, 'blue': 0.2},  # Dark gray text
+                'foregroundColor': SECTION_TEXT,
                 'bold': True,
                 'fontSize': 11
             }
         })
 
-    print(f"  ✓ Formatted {len(section_header_rows)} section headers")
+    print(f"  Formatted {len(section_header_rows)} section headers")
 
-    # Step 5: Set column widths for better readability
+    # Step 4: Set column widths
     print("  Adjusting column widths...")
     try:
-        # Set specific widths for key columns
         requests = [
-            {
-                'updateDimensionProperties': {
-                    'range': {
-                        'sheetId': ws.id,
-                        'dimension': 'COLUMNS',
-                        'startIndex': 0,  # PG Account Name
-                        'endIndex': 1
-                    },
-                    'properties': {'pixelSize': 150},
-                    'fields': 'pixelSize'
-                }
-            },
-            {
-                'updateDimensionProperties': {
-                    'range': {
-                        'sheetId': ws.id,
-                        'dimension': 'COLUMNS',
-                        'startIndex': 2,  # Acquiror
-                        'endIndex': 3
-                    },
-                    'properties': {'pixelSize': 200},
-                    'fields': 'pixelSize'
-                }
-            },
-            {
-                'updateDimensionProperties': {
-                    'range': {
-                        'sheetId': ws.id,
-                        'dimension': 'COLUMNS',
-                        'startIndex': 3,  # Target
-                        'endIndex': 4
-                    },
-                    'properties': {'pixelSize': 200},
-                    'fields': 'pixelSize'
-                }
-            },
-            {
-                'updateDimensionProperties': {
-                    'range': {
-                        'sheetId': ws.id,
-                        'dimension': 'COLUMNS',
-                        'startIndex': 6,  # Description
-                        'endIndex': 7
-                    },
-                    'properties': {'pixelSize': 300},
-                    'fields': 'pixelSize'
-                }
-            },
-            {
-                'updateDimensionProperties': {
-                    'range': {
-                        'sheetId': ws.id,
-                        'dimension': 'COLUMNS',
-                        'startIndex': 13,  # Opportunity
-                        'endIndex': 14
-                    },
-                    'properties': {'pixelSize': 300},
-                    'fields': 'pixelSize'
-                }
-            }
+            _col_width_request(ws.id, 0, 1, 150),   # PG Account Name
+            _col_width_request(ws.id, 2, 3, 200),   # Acquiror
+            _col_width_request(ws.id, 3, 4, 200),   # Target
+            _col_width_request(ws.id, 6, 7, 300),   # Description
+            _col_width_request(ws.id, 13, 14, 300), # Opportunity
         ]
-
         spreadsheet.batch_update({'requests': requests})
-        print("  ✓ Adjusted column widths")
+        print("  Adjusted column widths")
     except Exception as e:
         print(f"  Warning: Could not adjust column widths: {e}")
 
-    # Step 6: Add alternating row colors for data rows (subtle)
-    print("  Adding subtle row striping...")
-    try:
-        # Apply banding (alternating row colors)
-        requests = [{
-            'addBanding': {
-                'bandedRange': {
-                    'range': {
-                        'sheetId': ws.id,
-                        'startRowIndex': 3,  # Start after header
-                        'endRowIndex': num_rows,
-                        'startColumnIndex': 0,
-                        'endColumnIndex': num_cols
-                    },
-                    'rowProperties': {
-                        'headerColor': {'red': 0.85, 'green': 0.85, 'blue': 0.85},
-                        'firstBandColor': {'red': 1, 'green': 1, 'blue': 1},
-                        'secondBandColor': {'red': 0.98, 'green': 0.98, 'blue': 0.98}
-                    }
-                }
-            }
-        }]
-
-        spreadsheet.batch_update({'requests': requests})
-        print("  ✓ Added alternating row colors")
-    except Exception as e:
-        # May fail if banding already exists
-        print(f"  Note: {e}")
-
-    # Step 7: Ensure header row is frozen
+    # Step 5: Freeze header row
     print("  Freezing header row...")
     try:
-        ws.freeze(rows=3)
-        print("  ✓ Header row frozen")
+        ws.freeze(rows=1)
+        print("  Header row frozen")
     except Exception as e:
         print(f"  Note: {e}")
 
     print()
-    print("=" * 70)
+    print("=" * 60)
     print("FORMATTING CLEANUP COMPLETE")
-    print("=" * 70)
-    print("Sheet now has professional, clean formatting:")
-    print("  ✓ White background with no highlights")
-    print("  ✓ Black text, normal weight")
-    print("  ✓ Subtle gray backgrounds for headers and sections")
-    print("  ✓ Alternating row colors for better readability")
-    print("  ✓ Optimized column widths")
+    print("=" * 60)
+    print("Sheet formatting cleaned:")
+    print("  - White background, black text")
+    print("  - Blue header row (#2F5496)")
+    print("  - Gray section headers for date groups")
+    print("  - Optimized column widths")
     print(f"\nSheet URL: https://docs.google.com/spreadsheets/d/{spreadsheet.id}")
+
+
+def _col_width_request(sheet_id, start, end, width):
+    """Build a column width update request."""
+    return {
+        'updateDimensionProperties': {
+            'range': {
+                'sheetId': sheet_id,
+                'dimension': 'COLUMNS',
+                'startIndex': start,
+                'endIndex': end,
+            },
+            'properties': {'pixelSize': width},
+            'fields': 'pixelSize',
+        }
+    }
 
 
 def main():
     """Main entry point."""
-    print("=" * 70)
+    print("=" * 60)
     print("CLEAN SHEET FORMATTING")
-    print("=" * 70)
+    print("=" * 60)
     print()
 
     try:
         clean_sheet_formatting()
         return 0
     except Exception as e:
-        print(f"\n✗ Error: {e}", file=sys.stderr)
+        print(f"\nError: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         return 1

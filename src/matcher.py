@@ -37,7 +37,8 @@ def load_company_list(filepath: str) -> list[dict]:
     seen_clean_names = set()
 
     # Load from both A&B Customers and C&D Customers sheets
-    for sheet_name in ['A&B Customers', 'C&D Customers']:
+    sheet_tier_map = {'A&B Customers': 'AB', 'C&D Customers': 'CD'}
+    for sheet_name, tier in sheet_tier_map.items():
         if sheet_name not in workbook.sheetnames:
             raise ValueError(
                 f"Required sheet '{sheet_name}' not found in {filepath}. "
@@ -87,7 +88,8 @@ def load_company_list(filepath: str) -> list[dict]:
                     seen_clean_names.add(clean_name)
                     companies.append({
                         "account_name": account_name,
-                        "clean_name": clean_name
+                        "clean_name": clean_name,
+                        "tier": tier
                     })
 
     workbook.close()
@@ -96,6 +98,21 @@ def load_company_list(filepath: str) -> list[dict]:
         raise ValueError(f"No companies loaded from {filepath}")
 
     return companies
+
+
+def split_by_tier(companies: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Split companies into A&B and C&D tiers.
+
+    Args:
+        companies: List of company dicts with 'tier' key
+
+    Returns:
+        Tuple of (ab_companies, cd_companies)
+    """
+    ab = [c for c in companies if c.get("tier") == "AB"]
+    cd = [c for c in companies if c.get("tier") == "CD"]
+    return ab, cd
 
 
 def fuzzy_match(company_name: str, company_list: list[dict], threshold: int = 75) -> Optional[dict]:

@@ -10,7 +10,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 
@@ -21,7 +21,8 @@ DEALS_HEADERS = [
     "Date of Rumor", "Date of Announcement", "Date Closed",
     "Deal Value ($)", "Source", "Source Link",
     "Potential Opportunity for PG", "Source Validation",
-    # Hidden metadata columns (P onwards)
+    "Deal Type",
+    # Hidden metadata columns (Q onwards)
     "deal_id", "stages_reported", "first_seen", "last_updated", "scan_period"
 ]
 
@@ -35,6 +36,105 @@ UNVERIFIED_HEADERS = [
     "Original URL Attempted", "Validation Failure Reason",
     "Date Found", "scan_period"
 ]
+
+# Blue header color matching Excel (#2F5496)
+HEADER_BG = {"red": 0.184, "green": 0.329, "blue": 0.588}
+HEADER_TEXT = {"red": 1, "green": 1, "blue": 1}
+SECTION_BG = {"red": 0.9, "green": 0.9, "blue": 0.9}
+SECTION_TEXT = {"red": 0.2, "green": 0.2, "blue": 0.2}
+
+
+# ---------------------------------------------------------------------------
+# Date grouping helpers (shared across modules)
+# ---------------------------------------------------------------------------
+
+def get_deal_date(deal: dict) -> Optional[date]:
+    """Extract best available date from a deal dict.
+
+    Priority: date_closed > date_announced > date_rumor > Date Found.
+    Handles both raw pipeline dicts and Google Sheets record formats.
+    """
+    date_keys = [
+        "date_closed", "Date Closed",
+        "date_announced", "Date of Announcement",
+        "date_rumor", "Date of Rumor",
+        "Date Found",
+    ]
+    for key in date_keys:
+        val = deal.get(key, "")
+        if val:
+            try:
+                return date.fromisoformat(str(val).strip()[:10])
+            except (ValueError, AttributeError):
+                continue
+    return None
+
+
+def get_date_group(d: Optional[date], today: date = None) -> str:
+    """Categorize a date into one of the 5 groups.
+
+    Priority: last_week > ytd > prev_year > two_years_ago > prior.
+    """
+    if today is None:
+        today = date.today()
+
+    if d is None:
+        return "prior"
+
+    # Last week (Mon-Sun)
+    days_since_monday = today.weekday()
+    last_sunday = today - timedelta(days=days_since_monday + 1)
+    last_monday = last_sunday - timedelta(days=6)
+
+    if last_monday <= d <= last_sunday:
+        return "last_week"
+
+    # YTD (current year, excluding last week)
+    if date(today.year, 1, 1) <= d <= today:
+        return "ytd"
+
+    # Previous year
+    prev_year = today.year - 1
+    if date(prev_year, 1, 1) <= d <= date(prev_year, 12, 31):
+        return str(prev_year)
+
+    # Two years ago
+    two_years = today.year - 2
+    if date(two_years, 1, 1) <= d <= date(two_years, 12, 31):
+        return str(two_years)
+
+    return "prior"
+
+
+def get_date_group_order(today: date = None) -> list[str]:
+    """Return ordered list of date group keys."""
+    if today is None:
+        today = date.today()
+    return ["last_week", "ytd", str(today.year - 1), str(today.year - 2), "prior"]
+
+
+def get_group_header(group: str, today: date = None) -> str:
+    """Generate the section header text for a date group."""
+    if today is None:
+        today = date.today()
+
+    days_since_monday = today.weekday()
+    last_sunday = today - timedelta(days=days_since_monday + 1)
+    last_monday = last_sunday - timedelta(days=6)
+
+    if group == "last_week":
+        s = f"{last_monday.strftime('%b')} {last_monday.day}"
+        e = f"{last_sunday.strftime('%b')} {last_sunday.day}, {last_sunday.year}"
+        return f"═══ LAST WEEK ({s} - {e}) ═══"
+    elif group == "ytd":
+        t = f"{today.strftime('%b')} {today.day}, {today.year}"
+        return f"═══ YTD {today.year} (Jan 1 - {t}) ═══"
+    elif group == str(today.year - 1):
+        return f"═══ {today.year - 1} ═══"
+    elif group == str(today.year - 2):
+        return f"═══ {today.year - 2} ═══"
+    else:
+        return f"═══ PRIOR TO {today.year - 2} ═══"
 
 
 def get_sheets_client() -> gspread.Client:
@@ -146,12 +246,12 @@ def ensure_sheet_structure(spreadsheet: gspread.Spreadsheet) -> None:
                 # Add header row
                 ws.append_row(headers)
 
-                # Format header row: bold, dark blue background, white text
+                # Format header row: bold, blue background, white text
                 ws.format("1:1", {
-                    "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
+                    "backgroundColor": HEADER_BG,
                     "textFormat": {
                         "bold": True,
-                        "foregroundColor": {"red": 1, "green": 1, "blue": 1}
+                        "foregroundColor": HEADER_TEXT,
                     },
                 })
 
@@ -166,8 +266,8 @@ def ensure_sheet_structure(spreadsheet: gspread.Spreadsheet) -> None:
                             "range": {
                                 "sheetId": ws.id,
                                 "dimension": "COLUMNS",
-                                "startIndex": 15,  # Column P (0-indexed)
-                                "endIndex": 20     # Up to but not including column U
+                                "startIndex": 16,  # Column Q (0-indexed)
+                                "endIndex": 21     # Up to but not including column V
                             },
                             "properties": {
                                 "hiddenByUser": True
@@ -286,6 +386,58 @@ def build_dedup_state(existing_deals: list[dict]) -> dict:
     return state
 
 
+def _build_deal_row(deal: dict, today_str: str, scan_period: str) -> list:
+    """Build a row list for inserting into the Deals tab."""
+    return [
+        deal.get("pg_account_name", ""),
+        deal.get("clean_name", ""),
+        deal.get("acquiror", ""),
+        deal.get("target", ""),
+        deal.get("deal_status", ""),
+        deal.get("sector", ""),
+        deal.get("description", ""),
+        deal.get("date_rumor", ""),
+        deal.get("date_announced", ""),
+        deal.get("date_closed", ""),
+        deal.get("deal_value", ""),
+        deal.get("source", ""),
+        deal.get("source_link", ""),
+        deal.get("opportunity", ""),
+        deal.get("source_validation", ""),
+        deal.get("deal_type", ""),
+        # Metadata
+        deal.get("deal_id", ""),
+        ",".join(deal.get("stages_reported", [])),
+        deal.get("first_seen", today_str),
+        today_str,  # last_updated
+        scan_period,
+    ]
+
+
+def _find_section_rows(all_values: list, today: date) -> dict:
+    """Find section header rows and map group keys to row numbers (1-indexed)."""
+    section_rows = {}
+    prev_year = str(today.year - 1)
+    two_years = str(today.year - 2)
+
+    for i, row in enumerate(all_values, 1):
+        if not row or not str(row[0]).startswith("═══"):
+            continue
+        text = str(row[0]).upper()
+        if "LAST WEEK" in text:
+            section_rows["last_week"] = i
+        elif "YTD" in text:
+            section_rows["ytd"] = i
+        elif prev_year in text and "PRIOR" not in text:
+            section_rows[prev_year] = i
+        elif two_years in text and "PRIOR" not in text:
+            section_rows[two_years] = i
+        elif "PRIOR" in text:
+            section_rows["prior"] = i
+
+    return section_rows
+
+
 def append_new_deals(
     spreadsheet: gspread.Spreadsheet,
     new_deals: list[dict],
@@ -294,8 +446,8 @@ def append_new_deals(
     """
     Append new deals to the Deals tab.
 
-    Inserts at row 2 (just below headers) so newest deals appear at the top.
-    Applies yellow highlighting to new rows.
+    Inserts deals into the correct date group section.
+    If no section headers exist, falls back to inserting at row 2.
 
     Args:
         spreadsheet: gspread Spreadsheet object
@@ -306,43 +458,41 @@ def append_new_deals(
         return
 
     ws = spreadsheet.worksheet("Deals")
-    today = date.today().isoformat()
+    today_date = date.today()
+    today_str = today_date.isoformat()
 
-    rows_to_insert = []
+    # Read all values to find section headers
+    all_values = ws.get_all_values()
+    section_rows = _find_section_rows(all_values, today_date)
+
+    if not section_rows:
+        # No date groups found — fall back to insert at row 2
+        rows = [_build_deal_row(d, today_str, scan_period) for d in new_deals]
+        ws.insert_rows(rows, row=2)
+        return
+
+    # Group new deals by date group
+    grouped = {}
     for deal in new_deals:
-        row = [
-            deal.get("pg_account_name", ""),
-            deal.get("clean_name", ""),
-            deal.get("acquiror", ""),
-            deal.get("target", ""),
-            deal.get("deal_status", ""),
-            deal.get("sector", ""),
-            deal.get("description", ""),
-            deal.get("date_rumor", ""),
-            deal.get("date_announced", ""),
-            deal.get("date_closed", ""),
-            deal.get("deal_value", ""),
-            deal.get("source", ""),
-            deal.get("source_link", ""),
-            deal.get("opportunity", ""),
-            deal.get("source_validation", ""),
-            # Metadata
-            deal.get("deal_id", ""),
-            ",".join(deal.get("stages_reported", [])),
-            deal.get("first_seen", today),
-            today,  # last_updated
-            scan_period,
-        ]
-        rows_to_insert.append(row)
+        deal_date = get_deal_date(deal)
+        group = get_date_group(deal_date, today_date)
+        grouped.setdefault(group, []).append(deal)
 
-    # Insert at row 2 (below headers) so newest deals are at top
-    ws.insert_rows(rows_to_insert, row=2)
+    # Sort each group by date descending (newest first)
+    for group in grouped:
+        grouped[group].sort(
+            key=lambda d: get_deal_date(d) or date.min, reverse=True
+        )
 
-    # Highlight new rows yellow
-    num_new = len(rows_to_insert)
-    ws.format(f"2:{1 + num_new}", {
-        "backgroundColor": {"red": 1, "green": 1, "blue": 0.6}
-    })
+    # Insert bottom-to-top so row numbers stay valid
+    for group_key, header_row in sorted(
+        section_rows.items(), key=lambda x: x[1], reverse=True
+    ):
+        if group_key not in grouped:
+            continue
+        rows = [_build_deal_row(d, today_str, scan_period) for d in grouped[group_key]]
+        ws.insert_rows(rows, row=header_row + 1)
+        time.sleep(1)  # Rate limiting
 
 
 def append_rows_with_rate_limit(
@@ -639,6 +789,21 @@ def update_executive_summary(
 
     for status, count in sorted(status_counts.items()):
         summary.append([f"  {status}: {count}"])
+
+    # Count by deal type
+    summary.append([""])
+    summary.append(["DEALS BY TYPE"])
+    type_counts = {}
+    for deal in all_deals:
+        deal_type = deal.get("Deal Type", deal.get("deal_type", ""))
+        if deal_type:
+            type_counts[deal_type] = type_counts.get(deal_type, 0) + 1
+
+    if type_counts:
+        for dtype, count in sorted(type_counts.items(), key=lambda x: x[1], reverse=True):
+            summary.append([f"  {dtype}: {count}"])
+    else:
+        summary.append(["  No deal types recorded"])
 
     # Count by sector
     summary.append([""])
